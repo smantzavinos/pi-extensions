@@ -40,9 +40,11 @@ import {
   FLAG_BUFFER,
   FLAG_PROMPT,
   FLAG_SOFT_AT,
+  parseThresholdsCommandArgs,
   resolveThresholdsWithDefaults,
   tokensToPercent,
   type ConfigResult,
+  type ThresholdOverrides,
 } from './config.js';
 import { contextBarLine, latestApplicableCacheRead } from './bar.js';
 import {
@@ -63,11 +65,13 @@ export const STATE_ENTRY = 'self-compact:state';
 export const DELIVERY_ENTRY = 'self-compact:delivered';
 export const NOTIFY_ENTRY = 'self-compact:notify';
 export const HARD_ENTRY = 'self-compact:hard';
+export const THRESHOLDS_ENTRY = 'self-compact:thresholds';
 export const CONTINUATION_MESSAGE_TYPE = 'self-compact:continuation';
 export const GUIDANCE_MESSAGE_TYPE = 'self-compact:guidance';
 export const WIDGET_KEY = 'self-compact';
 export const INFO_COMMAND = 'self-compact-info';
 export const NOW_COMMAND = 'self-compact-now';
+export const THRESHOLDS_COMMAND = 'self-compact-thresholds';
 export const MAX_NOTE_LENGTH = 24000;
 
 export type ThresholdLevel = 'none' | 'soft' | 'warning' | 'hard';
@@ -213,6 +217,32 @@ export function readHardState(entries: SessionEntry[]): HardEntryState | undefin
   return undefined;
 }
 
+/** Normalize persisted threshold overrides, or undefined when malformed. */
+function parseThresholdOverridesEntry(data: unknown): ThresholdOverrides | undefined {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return undefined;
+  const d = data as Record<string, unknown>;
+  const out: ThresholdOverrides = {};
+  for (const key of ['softAt', 'at', 'buffer'] as const) {
+    const value = d[key];
+    if (value === undefined) continue;
+    if (typeof value !== 'string') return undefined;
+    out[key] = value;
+  }
+  return out;
+}
+
+/** Latest well-formed session threshold overrides on the branch, or undefined if none. */
+export function readThresholdOverrides(entries: SessionEntry[]): ThresholdOverrides | undefined {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry && isCustomEntry(entry, THRESHOLDS_ENTRY)) {
+      const parsed = parseThresholdOverridesEntry(entry.data);
+      if (parsed) return parsed;
+    }
+  }
+  return undefined;
+}
+
 interface AssistantToolCall {
   name: string;
   arguments: Record<string, unknown>;
@@ -283,17 +313,27 @@ export default function (
     return typeof value === 'string' ? value : undefined;
   }
 
+  function hasOverrides(overrides: ThresholdOverrides | undefined): boolean {
+    return (
+      overrides !== undefined &&
+      (overrides.softAt !== undefined || overrides.at !== undefined || overrides.buffer !== undefined)
+    );
+  }
+
   /** Compute (without side effects) the threshold config for the current model. */
-  function computeConfig(ctx: ExtensionContext): ConfigResult {
+  function computeConfig(
+    ctx: ExtensionContext,
+    overrides: ThresholdOverrides | undefined = readThresholdOverrides(branch(ctx)),
+  ): ConfigResult {
     const window = ctx.model?.contextWindow;
     if (typeof window !== 'number') {
       return { ok: false, error: 'self-compact: no model selected; cannot resolve thresholds' };
     }
     return resolveThresholdsWithDefaults(
       {
-        softAt: flagOptional(FLAG_SOFT_AT),
-        at: flagOptional(FLAG_AT),
-        buffer: flagOptional(FLAG_BUFFER),
+        softAt: overrides?.softAt ?? flagOptional(FLAG_SOFT_AT),
+        at: overrides?.at ?? flagOptional(FLAG_AT),
+        buffer: overrides?.buffer ?? flagOptional(FLAG_BUFFER),
         compactPrompt: flagOptional(FLAG_PROMPT),
       },
       window,
@@ -304,6 +344,37 @@ export default function (
   function resolveConfig(ctx: ExtensionContext): void {
     config = computeConfig(ctx);
     if (!config.ok) ctx.ui.notify(config.error, 'error');
+  }
+
+  /**
+   * Release the latched hard-cutoff tool lock when the resolved hard cutoff is
+   * above current usage, unless a self_compact handoff owns tool state.
+   */
+  function maybeReleaseHardLock(ctx: ExtensionContext): void {
+    const state = currentState(ctx);
+    const tokens = measuredTokens(ctx);
+    if (
+      config?.ok &&
+      !(state && isLockedPhase(state.phase)) &&
+      tokens !== null &&
+      tokens < config.thresholds.hardTokens
+    ) {
+      exitHard();
+    }
+  }
+
+  /** Format the active threshold summary line for command feedback. */
+  function formatResolvedSummary(result: ConfigResult, overrides: ThresholdOverrides | undefined): string {
+    if (!result.ok) return result.error;
+    const t = result.thresholds;
+    const source = hasOverrides(overrides) ? 'session overrides' : 'startup defaults/flags';
+    return (
+      `self-compact thresholds (${source}): ` +
+      `soft=${t.softTokens} (${tokensToPercent(t.softTokens, t.contextWindow)}%), ` +
+      `warning=${t.warningTokens} (${tokensToPercent(t.warningTokens, t.contextWindow)}%), ` +
+      `hard=${t.hardTokens} (${tokensToPercent(t.hardTokens, t.contextWindow)}%), ` +
+      `max=${t.cap} (window=${t.contextWindow})`
+    );
   }
 
   /**
@@ -879,6 +950,16 @@ export default function (
     lines.push(
       `  flags: --compact-soft-at=${shown(FLAG_SOFT_AT)} --compact-at=${shown(FLAG_AT)} --compact-buffer=${shown(FLAG_BUFFER)}`,
     );
+    const overrides = readThresholdOverrides(branch(ctx));
+    if (hasOverrides(overrides)) {
+      const parts: string[] = [];
+      if (overrides?.softAt !== undefined) parts.push(`soft=${overrides.softAt}`);
+      if (overrides?.at !== undefined) parts.push(`at=${overrides.at}`);
+      if (overrides?.buffer !== undefined) parts.push(`buffer=${overrides.buffer}`);
+      lines.push(`  session overrides: ${parts.join(' ')}`);
+    } else {
+      lines.push('  session overrides: (none)');
+    }
     const promptFlag = flagOptional(FLAG_PROMPT);
     lines.push(
       `  --compact-prompt: ${promptFlag === undefined ? '(unset; using default file)' : 'literal override set'}`,
@@ -923,6 +1004,83 @@ export default function (
     description: 'Show self-compaction thresholds, usage, and handoff state (does not call the model).',
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       ctx.ui.notify(buildInfoReport(ctx), 'info');
+    },
+  });
+
+  pi.registerCommand(THRESHOLDS_COMMAND, {
+    description:
+      'Show or change self-compaction thresholds for this session (e.g. soft=55% at=65% buffer=10%, or reset).',
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      const parsed = parseThresholdsCommandArgs(args);
+      if (!parsed.ok) {
+        ctx.ui.notify(parsed.error, 'error');
+        return;
+      }
+
+      const currentOverrides = readThresholdOverrides(branch(ctx));
+      if (parsed.action.kind === 'show') {
+        ensureConfig(ctx);
+        ctx.ui.notify(
+          formatResolvedSummary(config ?? computeConfig(ctx, currentOverrides), currentOverrides),
+          config?.ok === false ? 'error' : 'info',
+        );
+        return;
+      }
+
+      const nextOverrides: ThresholdOverrides =
+        parsed.action.kind === 'reset'
+          ? {}
+          : {
+              ...(currentOverrides?.softAt !== undefined ? { softAt: currentOverrides.softAt } : {}),
+              ...(currentOverrides?.at !== undefined ? { at: currentOverrides.at } : {}),
+              ...(currentOverrides?.buffer !== undefined ? { buffer: currentOverrides.buffer } : {}),
+              ...parsed.action.updates,
+            };
+
+      const candidate = computeConfig(ctx, nextOverrides);
+      if (!candidate.ok) {
+        if (parsed.action.kind === 'reset') {
+          try {
+            pi.appendEntry(THRESHOLDS_ENTRY, nextOverrides);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            ctx.ui.notify(`self-compact: failed to reset session thresholds: ${message}`, 'error');
+            return;
+          }
+          config = candidate;
+          updateWidget(ctx);
+          ctx.ui.notify(`self-compact thresholds reset to startup flags: ${candidate.error}`, 'error');
+          return;
+        }
+        ctx.ui.notify(`${candidate.error} (existing thresholds unchanged)`, 'error');
+        return;
+      }
+
+      try {
+        pi.appendEntry(THRESHOLDS_ENTRY, nextOverrides);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        ctx.ui.notify(`self-compact: failed to save session thresholds: ${message}`, 'error');
+        return;
+      }
+
+      config = candidate;
+      maybeReleaseHardLock(ctx);
+      // Lowering a threshold can put usage below a previously announced level
+      // (or clear a stale notification rank); keep NOTIFY_ENTRY monotonic per
+      // cycle only for levels still at/below current level when raising.
+      const tokens = measuredTokens(ctx);
+      if (tokens !== null) {
+        const handoff = currentState(ctx);
+        const cycle = handoff?.completedCycles ?? 0;
+        const level = currentLevel(tokens);
+        const last = readNotifyState(branch(ctx));
+        if (last && last.cycle === cycle && LEVEL_RANK[level] < LEVEL_RANK[last.level]) {
+          persistNotify({ level, cycle });
+        }
+      }
+      evaluateThresholds(ctx);
+      ctx.ui.notify(formatResolvedSummary(config, nextOverrides), 'info');
     },
   });
 
@@ -1163,15 +1321,7 @@ export default function (
     resolveConfig(ctx);
     // A new window can move the hard cutoff above current usage. Release the
     // latched hard lock then, unless a handoff owns tool state.
-    const state = currentState(ctx);
-    const tokens = measuredTokens(ctx);
-    if (
-      config?.ok &&
-      !(state && isLockedPhase(state.phase)) &&
-      tokens !== null &&
-      tokens < config.thresholds.hardTokens
-    )
-      exitHard();
+    maybeReleaseHardLock(ctx);
     evaluateThresholds(ctx);
   });
 

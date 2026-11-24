@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   parseThreshold,
+  parseThresholdsCommandArgs,
   resolveThresholds,
   resolveThresholdsWithDefaults,
   resolveTokens,
@@ -196,5 +197,47 @@ describe('resolveThresholdsWithDefaults', () => {
   it('fails closed when explicit flags cannot fit', () => {
     expect(resolveThresholdsWithDefaults({ softAt: '225k', at: '250k', buffer: '20k' }, 200000).ok).toBe(false);
     expect(resolveThresholdsWithDefaults({ ...none, at: '250k' }, 200000).ok).toBe(false);
+  });
+});
+
+describe('parseThresholdsCommandArgs', () => {
+  it('returns show when args are empty or whitespace', () => {
+    expect(parseThresholdsCommandArgs('')).toEqual({ ok: true, action: { kind: 'show' } });
+    expect(parseThresholdsCommandArgs('   \t  ')).toEqual({ ok: true, action: { kind: 'show' } });
+  });
+
+  it('returns reset when args are reset (case-insensitive)', () => {
+    expect(parseThresholdsCommandArgs('reset')).toEqual({ ok: true, action: { kind: 'reset' } });
+    expect(parseThresholdsCommandArgs('  RESET  ')).toEqual({ ok: true, action: { kind: 'reset' } });
+  });
+
+  it('parses full and partial key=value updates including aliases and zero buffer', () => {
+    expect(parseThresholdsCommandArgs('soft=55% at=65% buffer=10%')).toEqual({
+      ok: true,
+      action: { kind: 'set', updates: { softAt: '55%', at: '65%', buffer: '10%' } },
+    });
+    expect(parseThresholdsCommandArgs('at=180k')).toEqual({
+      ok: true,
+      action: { kind: 'set', updates: { at: '180k' } },
+    });
+    expect(parseThresholdsCommandArgs('--compact-soft-at=40% warning=60% --compact-buffer=0')).toEqual({
+      ok: true,
+      action: { kind: 'set', updates: { softAt: '40%', at: '60%', buffer: '0' } },
+    });
+  });
+
+  it.each([
+    'reset at=50%',
+    'at=50% reset',
+    '50%',
+    'foo=50%',
+    'soft=40% soft=50%',
+    'at=50% warning=60%',
+    'soft=0',
+    'at=-5%',
+    'buffer=abc',
+    'soft=',
+  ])('rejects invalid argument string: "%s"', (raw) => {
+    expect(parseThresholdsCommandArgs(raw).ok).toBe(false);
   });
 });

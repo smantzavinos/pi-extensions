@@ -142,6 +142,7 @@ describe('standalone loading through the real Pi resource loader', () => {
     expect(extension?.tools.has('self_compact')).toBe(true);
     expect(extension?.commands.has('self-compact-info')).toBe(true);
     expect(extension?.commands.has('self-compact-now')).toBe(true);
+    expect(extension?.commands.has('self-compact-thresholds')).toBe(true);
     for (const flag of ['compact-soft-at', 'compact-at', 'compact-buffer', 'compact-prompt']) {
       expect(extension?.flags.has(flag)).toBe(true);
     }

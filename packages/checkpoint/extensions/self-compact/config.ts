@@ -206,6 +206,86 @@ export const FALLBACK_SOFT_AT = '60%';
 export const FALLBACK_AT = '70%';
 export const FALLBACK_BUFFER = '10%';
 
+/** Branch-local session overrides for threshold values (`undefined` = inherit startup flag/default). */
+export interface ThresholdOverrides {
+  softAt?: string | undefined;
+  at?: string | undefined;
+  buffer?: string | undefined;
+}
+
+export type ThresholdCommandAction =
+  | { kind: 'show' }
+  | { kind: 'reset' }
+  | { kind: 'set'; updates: ThresholdOverrides };
+
+export type ThresholdCommandParseResult = { ok: true; action: ThresholdCommandAction } | { ok: false; error: string };
+
+const THRESHOLD_COMMAND_USAGE =
+  'usage: /self-compact-thresholds [soft=<val>] [at=<val>] [buffer=<val>] | reset (e.g. soft=55% at=65% buffer=10%)';
+
+const KEY_ALIASES: Readonly<Record<string, keyof ThresholdOverrides>> = {
+  soft: 'softAt',
+  'soft-at': 'softAt',
+  'compact-soft-at': 'softAt',
+  at: 'at',
+  warning: 'at',
+  'compact-at': 'at',
+  buffer: 'buffer',
+  'compact-buffer': 'buffer',
+};
+
+/**
+ * Parse `/self-compact-thresholds` arguments.
+ *
+ * Accepts:
+ *   - blank -> show current thresholds
+ *   - `reset` -> clear session overrides back to startup flags/defaults
+ *   - one or more `key=value` tokens (`soft`, `at`/`warning`, `buffer`, or
+ *     their `compact-*` equivalents). Each key may appear at most once.
+ */
+export function parseThresholdsCommandArgs(rawArgs: string): ThresholdCommandParseResult {
+  const trimmed = rawArgs.trim();
+  if (trimmed.length === 0) return { ok: true, action: { kind: 'show' } };
+
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length === 1 && tokens[0]?.toLowerCase() === 'reset') {
+    return { ok: true, action: { kind: 'reset' } };
+  }
+
+  const updates: ThresholdOverrides = {};
+  for (const token of tokens) {
+    if (token.toLowerCase() === 'reset') {
+      return {
+        ok: false,
+        error: `self-compact: "reset" cannot be combined with threshold assignments; ${THRESHOLD_COMMAND_USAGE}`,
+      };
+    }
+    const eq = token.indexOf('=');
+    if (eq <= 0) {
+      return { ok: false, error: `self-compact: invalid argument "${token}"; ${THRESHOLD_COMMAND_USAGE}` };
+    }
+    const rawKey = token.slice(0, eq).replace(/^--/, '').toLowerCase();
+    const rawValue = token.slice(eq + 1);
+    const field = KEY_ALIASES[rawKey];
+    if (!field) {
+      return {
+        ok: false,
+        error: `self-compact: unknown threshold key "${token.slice(0, eq)}"; expected soft, at, or buffer. ${THRESHOLD_COMMAND_USAGE}`,
+      };
+    }
+    if (updates[field] !== undefined) {
+      return { ok: false, error: `self-compact: duplicate key "${rawKey}"; ${THRESHOLD_COMMAND_USAGE}` };
+    }
+    const parsed = parseThreshold(rawValue, { allowZero: field === 'buffer' });
+    if (!parsed.ok) {
+      return { ok: false, error: `self-compact: ${rawKey} ${parsed.error}` };
+    }
+    updates[field] = rawValue.trim();
+  }
+
+  return { ok: true, action: { kind: 'set', updates } };
+}
+
 /** Raw flag values; `undefined` means the flag was not supplied. */
 export interface RawFlagInputs {
   softAt: string | undefined;

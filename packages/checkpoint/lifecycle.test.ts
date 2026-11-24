@@ -18,8 +18,11 @@ import extension, {
   MAX_NOTE_LENGTH,
   NOW_COMMAND,
   STATE_ENTRY,
+  THRESHOLDS_COMMAND,
+  THRESHOLDS_ENTRY,
   TOOL_NAME,
   readHandoffState,
+  readThresholdOverrides,
   validateNote,
   type HandoffState,
 } from './extensions/self-compact/self-compact.js';
@@ -960,5 +963,179 @@ describe('human commands', () => {
     await h.runCommand(NOW_COMMAND);
     const req = h.sent().find((m) => m.customType === 'self-compact:manual-request');
     expect(String(req?.content)).toMatch(/note_to_self/);
+  });
+});
+
+describe('/self-compact-thresholds', () => {
+  it('shows current thresholds without calling the model or writing journal entries', async () => {
+    const h = makeHarness({ contextWindow: 1_000_000 });
+    await h.fire('session_start');
+    await h.runCommand(THRESHOLDS_COMMAND, '');
+    expect(h.sent()).toHaveLength(0);
+    expect(h.appended.filter((a) => a.type === THRESHOLDS_ENTRY)).toHaveLength(0);
+    expect(h.notes().at(-1)?.message).toContain('soft=225000');
+    expect(h.notes().at(-1)?.message).toContain('warning=250000');
+    expect(h.notes().at(-1)?.message).toContain('hard=270000');
+  });
+
+  it('applies full and partial updates, reflects them in /self-compact-info, and resets cleanly', async () => {
+    const h = makeHarness({ contextWindow: 200_000 });
+    await h.fire('session_start');
+
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=40% at=60% buffer=10%');
+    expect(readThresholdOverrides(h.entries)).toEqual({ softAt: '40%', at: '60%', buffer: '10%' });
+    expect(h.notes().at(-1)?.type).toBe('info');
+    expect(h.notes().at(-1)?.message).toContain('soft=80000 (40%)');
+    expect(h.notes().at(-1)?.message).toContain('warning=120000 (60%)');
+    expect(h.notes().at(-1)?.message).toContain('hard=140000 (70%)');
+
+    // Partial update merges with prior session overrides.
+    await h.runCommand(THRESHOLDS_COMMAND, 'buffer=0');
+    expect(readThresholdOverrides(h.entries)).toEqual({ softAt: '40%', at: '60%', buffer: '0' });
+    expect(h.notes().at(-1)?.message).toContain('hard=120000 (60%)');
+
+    await h.runCommand(INFO_COMMAND);
+    const info = h.notes().at(-1)?.message ?? '';
+    expect(info).toContain('session overrides: soft=40% at=60% buffer=0');
+    expect(info).toContain('hard=120000 (60%)');
+
+    // Reset restores startup defaults (60%/70%/10% fallback on 200k window).
+    await h.runCommand(THRESHOLDS_COMMAND, 'reset');
+    expect(readThresholdOverrides(h.entries)).toEqual({});
+    expect(h.notes().at(-1)?.message).toContain('startup defaults/flags');
+    expect(h.notes().at(-1)?.message).toContain('soft=120000 (60%)');
+
+    await h.runCommand(INFO_COMMAND);
+    expect(h.notes().at(-1)?.message).toContain('session overrides: (none)');
+  });
+
+  it('rejects invalid input and invalid ordering without modifying active thresholds or appending entries', async () => {
+    const h = makeHarness({ contextWindow: 200_000 });
+    await h.fire('session_start');
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=40% at=60% buffer=10%');
+    const entriesBefore = h.appended.length;
+
+    // Invalid syntax
+    await h.runCommand(THRESHOLDS_COMMAND, 'bogus=50%');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect(h.appended.length).toBe(entriesBefore);
+
+    // Invalid ordering (soft >= at)
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=70%');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect(h.notes().at(-1)?.message).toContain('existing thresholds unchanged');
+    expect(h.appended.length).toBe(entriesBefore);
+
+    // Exceeds 90% cap
+    await h.runCommand(THRESHOLDS_COMMAND, 'at=95%');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect(h.appended.length).toBe(entriesBefore);
+
+    // Active config still reflects 40%/60%/10%
+    await h.runCommand(THRESHOLDS_COMMAND);
+    expect(h.notes().at(-1)?.message).toContain('soft=80000 (40%)');
+    expect(h.notes().at(-1)?.message).toContain('warning=120000 (60%)');
+  });
+
+  it('raises the hard cutoff to lift a threshold-only hard lock, and lowers it to enforce immediately', async () => {
+    const h = makeHarness({ initialActive: ['read', 'bash', TOOL_NAME], contextWindow: 1_000_000 });
+    await h.fire('session_start');
+    h.setUsage(280_000);
+    await h.fire('turn_end');
+    expect(h.active()).toEqual([TOOL_NAME]);
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toMatchObject({ block: true });
+
+    // Raise hard cutoff above 280k -> tools unlock immediately.
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=300k at=400k buffer=50k');
+    expect(h.active()).toEqual(['read', 'bash', TOOL_NAME]);
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toBeUndefined();
+
+    // Lower hard cutoff below 280k -> tools hard-lock immediately and widget reflects error color.
+    const colors: unknown[] = [];
+    h.events.on('self-compact:context-color', (c) => colors.push(c));
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=100k at=200k buffer=50k');
+    expect(h.active()).toEqual([TOOL_NAME]);
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toMatchObject({ block: true });
+    expect(colors.at(-1)).toBe('error');
+  });
+
+  it('never unlocks an active or failed self_compact handoff when raising thresholds', async () => {
+    const h = makeHarness({ initialActive: ['read', 'bash', TOOL_NAME], contextWindow: 1_000_000 });
+    await h.fire('session_start');
+    h.setUsage(280_000);
+    await h.call('Finish task after compaction');
+    expect(h.active()).toEqual([TOOL_NAME]);
+
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=500k at=600k buffer=50k');
+    expect(h.active()).toEqual([TOOL_NAME]);
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toMatchObject({ block: true });
+  });
+
+  it('persists overrides across reload, re-resolves percentages on model_select, and isolates across branches', async () => {
+    const h = makeHarness({ contextWindow: 200_000 });
+    await h.fire('session_start');
+    const preOverrideBranch = [...h.entries];
+
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=30% at=50% buffer=10%');
+    // Simulate reload (session_start on same branch).
+    await h.fire('session_start');
+    await h.runCommand(THRESHOLDS_COMMAND);
+    expect(h.notes().at(-1)?.message).toContain('soft=60000 (30%)');
+    expect(h.notes().at(-1)?.message).toContain('hard=120000 (60%)');
+
+    // Switch to a larger model: percentage overrides re-resolve against the new window.
+    h.ctx.model = { contextWindow: 1_000_000 } as typeof h.ctx.model;
+    await h.fire('model_select');
+    await h.runCommand(THRESHOLDS_COMMAND);
+    expect(h.notes().at(-1)?.message).toContain('soft=300000 (30%)');
+    expect(h.notes().at(-1)?.message).toContain('warning=500000 (50%)');
+    expect(h.notes().at(-1)?.message).toContain('hard=600000 (60%)');
+
+    // Navigate to a branch without the override entry: overrides are isolated.
+    await h.fire('session_before_tree');
+    h.entries.splice(0, h.entries.length, ...preOverrideBranch);
+    await h.fire('session_tree');
+    await h.runCommand(THRESHOLDS_COMMAND);
+    expect(h.notes().at(-1)?.message).toContain('startup defaults/flags');
+    expect(h.notes().at(-1)?.message).toContain('soft=225000');
+  });
+
+  it('can recover a session that started fail-closed from explicit flags', async () => {
+    const h = makeHarness({
+      initialActive: ['read', 'bash', TOOL_NAME],
+      contextWindow: 200_000,
+      flags: { 'compact-soft-at': '225k', 'compact-at': '250k', 'compact-buffer': '20k' },
+    });
+    await h.fire('session_start');
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toMatchObject({ block: true });
+
+    // Override with valid percentages -> tools immediately become usable.
+    await h.runCommand(THRESHOLDS_COMMAND, 'soft=50% at=70% buffer=10%');
+    expect(h.notes().at(-1)?.type).toBe('info');
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toBeUndefined();
+
+    // Reset returns to the invalid startup flags (fail-closed again).
+    await h.runCommand(THRESHOLDS_COMMAND, 'reset');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect((await h.fire('tool_call', { toolName: 'bash' }))[0]).toMatchObject({ block: true });
+  });
+
+  it('ignores malformed persisted threshold entries', () => {
+    const custom = (id: string, data: unknown): SessionEntry =>
+      ({
+        type: 'custom',
+        customType: THRESHOLDS_ENTRY,
+        data,
+        id,
+        parentId: null,
+        timestamp: new Date().toISOString(),
+      }) as SessionEntry;
+
+    expect(readThresholdOverrides([custom('a', { softAt: '40%', at: '60%' }), custom('b', { softAt: 123 })])).toEqual({
+      softAt: '40%',
+      at: '60%',
+    });
+    expect(readThresholdOverrides([custom('a', 'invalid')])).toBeUndefined();
+    expect(readThresholdOverrides([custom('a', ['40%'])])).toBeUndefined();
   });
 });

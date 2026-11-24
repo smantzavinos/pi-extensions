@@ -36,8 +36,9 @@ pi -e /abs/path/packages/checkpoint/extensions/self-compact/self-compact.ts
   context is getting large. The note is preserved verbatim and re-delivered
   after compaction.
 - **Commands:** `/self-compact-info` (thresholds, usage, handoff state — never
-  calls the model) and `/self-compact-now` (asks the agent to checkpoint now;
-  retries a pending note verbatim).
+  calls the model), `/self-compact-thresholds` (inspect, update, or reset
+  compaction thresholds for the active session), and `/self-compact-now` (asks
+  the agent to checkpoint now; retries a pending note verbatim).
 - **Context display:** when `@nicknisi/pi-composer` (1.0+) shows a context
   meter, Checkpoint colors it and hides the separate widget. Without one, a
   20-cell context widget remains above the editor (legend below).
@@ -80,6 +81,23 @@ percentages instead, e.g. `--compact-soft-at 20% --compact-at 50% --compact-buff
 Thresholds are re-resolved when you switch models. Ordinary tools otherwise stay
 hard-paused until compaction, but if the new model's hard cutoff is above current
 usage, they are restored (unless a `self_compact` handoff is pending).
+
+**Runtime overrides.** Use `/self-compact-thresholds` during an active session
+without restarting Pi:
+
+```text
+/self-compact-thresholds                               # show active thresholds
+/self-compact-thresholds soft=55% at=65% buffer=10%    # set all three
+/self-compact-thresholds at=180k                       # partial update
+/self-compact-thresholds reset                         # revert to startup flags/defaults
+```
+
+Overrides are validated before applying (invalid input leaves existing
+thresholds unchanged), persisted in a branch-local session entry so they survive
+`/reload` and session resume without affecting other sessions, and re-evaluated
+immediately against current usage (raising the hard cutoff lifts a
+threshold-only tool pause, but never unlocks an active or failed `self_compact`
+handoff).
 
 ## Launch variants
 
