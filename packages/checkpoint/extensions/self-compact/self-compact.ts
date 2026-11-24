@@ -40,10 +40,13 @@ import {
   FLAG_BUFFER,
   FLAG_PROMPT,
   FLAG_SOFT_AT,
+  adjustThresholds,
+  parseThresholdDeltaArgs,
   parseThresholdsCommandArgs,
   resolveThresholdsWithDefaults,
   tokensToPercent,
   type ConfigResult,
+  type RawFlagInputs,
   type ThresholdOverrides,
 } from './config.js';
 import { contextBarLine, latestApplicableCacheRead } from './bar.js';
@@ -72,6 +75,8 @@ export const WIDGET_KEY = 'self-compact';
 export const INFO_COMMAND = 'self-compact-info';
 export const NOW_COMMAND = 'self-compact-now';
 export const THRESHOLDS_COMMAND = 'self-compact-thresholds';
+export const THRESHOLDS_INCREASE_COMMAND = 'self-compact-thresholds-increase';
+export const THRESHOLDS_DECREASE_COMMAND = 'self-compact-thresholds-decrease';
 export const MAX_NOTE_LENGTH = 24000;
 
 export type ThresholdLevel = 'none' | 'soft' | 'warning' | 'hard';
@@ -320,6 +325,15 @@ export default function (
     );
   }
 
+  function mergedRawInputs(overrides: ThresholdOverrides | undefined): RawFlagInputs {
+    return {
+      softAt: overrides?.softAt ?? flagOptional(FLAG_SOFT_AT),
+      at: overrides?.at ?? flagOptional(FLAG_AT),
+      buffer: overrides?.buffer ?? flagOptional(FLAG_BUFFER),
+      compactPrompt: flagOptional(FLAG_PROMPT),
+    };
+  }
+
   /** Compute (without side effects) the threshold config for the current model. */
   function computeConfig(
     ctx: ExtensionContext,
@@ -329,15 +343,7 @@ export default function (
     if (typeof window !== 'number') {
       return { ok: false, error: 'self-compact: no model selected; cannot resolve thresholds' };
     }
-    return resolveThresholdsWithDefaults(
-      {
-        softAt: overrides?.softAt ?? flagOptional(FLAG_SOFT_AT),
-        at: overrides?.at ?? flagOptional(FLAG_AT),
-        buffer: overrides?.buffer ?? flagOptional(FLAG_BUFFER),
-        compactPrompt: flagOptional(FLAG_PROMPT),
-      },
-      window,
-    );
+    return resolveThresholdsWithDefaults(mergedRawInputs(overrides), window);
   }
 
   /** Re-resolve flags against the current model window; notify on an invalid ordering. */
@@ -1007,6 +1013,96 @@ export default function (
     },
   });
 
+  /**
+   * Persist and apply a validated set of session threshold overrides, updating
+   * the widget, notification rank, and threshold-based hard lock immediately.
+   */
+  function applyThresholdOverrides(
+    ctx: ExtensionContext,
+    nextOverrides: ThresholdOverrides,
+    options: { allowInvalidReset?: boolean } = {},
+  ): boolean {
+    const candidate = computeConfig(ctx, nextOverrides);
+    if (!candidate.ok) {
+      if (options.allowInvalidReset) {
+        try {
+          pi.appendEntry(THRESHOLDS_ENTRY, nextOverrides);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          ctx.ui.notify(`self-compact: failed to reset session thresholds: ${message}`, 'error');
+          return false;
+        }
+        config = candidate;
+        updateWidget(ctx);
+        ctx.ui.notify(`self-compact thresholds reset to startup flags: ${candidate.error}`, 'error');
+        return true;
+      }
+      ctx.ui.notify(`${candidate.error} (existing thresholds unchanged)`, 'error');
+      return false;
+    }
+
+    try {
+      pi.appendEntry(THRESHOLDS_ENTRY, nextOverrides);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      ctx.ui.notify(`self-compact: failed to save session thresholds: ${message}`, 'error');
+      return false;
+    }
+
+    config = candidate;
+    maybeReleaseHardLock(ctx);
+    // Raising a threshold can put usage below a previously announced level;
+    // keep NOTIFY_ENTRY monotonic per cycle only for levels still at/below the
+    // current level so future crossings re-notify cleanly.
+    const tokens = measuredTokens(ctx);
+    if (tokens !== null) {
+      const handoff = currentState(ctx);
+      const cycle = handoff?.completedCycles ?? 0;
+      const level = currentLevel(tokens);
+      const last = readNotifyState(branch(ctx));
+      if (last && last.cycle === cycle && LEVEL_RANK[level] < LEVEL_RANK[last.level]) {
+        persistNotify({ level, cycle });
+      }
+    }
+    evaluateThresholds(ctx);
+    ctx.ui.notify(formatResolvedSummary(config, nextOverrides), 'info');
+    return true;
+  }
+
+  function handleThresholdDeltaCommand(
+    direction: 'increase' | 'decrease',
+    commandName: string,
+    args: string,
+    ctx: ExtensionCommandContext,
+  ): void {
+    const parsed = parseThresholdDeltaArgs(args, commandName);
+    if (!parsed.ok) {
+      ctx.ui.notify(parsed.error, 'error');
+      return;
+    }
+    const window = ctx.model?.contextWindow;
+    if (typeof window !== 'number') {
+      ctx.ui.notify('self-compact: no model selected; cannot adjust thresholds', 'error');
+      return;
+    }
+    const currentOverrides = readThresholdOverrides(branch(ctx));
+    const adjusted = adjustThresholds(mergedRawInputs(currentOverrides), window, direction, parsed.delta);
+    if (!adjusted.ok) {
+      ctx.ui.notify(`${adjusted.error} (existing thresholds unchanged)`, 'error');
+      return;
+    }
+    const nextOverrides: ThresholdOverrides = {
+      ...(currentOverrides?.buffer !== undefined
+        ? { buffer: currentOverrides.buffer }
+        : adjusted.buffer !== undefined
+          ? { buffer: adjusted.buffer }
+          : {}),
+      softAt: adjusted.softAt,
+      at: adjusted.at,
+    };
+    applyThresholdOverrides(ctx, nextOverrides);
+  }
+
   pi.registerCommand(THRESHOLDS_COMMAND, {
     description:
       'Show or change self-compaction thresholds for this session (e.g. soft=55% at=65% buffer=10%, or reset).',
@@ -1037,50 +1133,23 @@ export default function (
               ...parsed.action.updates,
             };
 
-      const candidate = computeConfig(ctx, nextOverrides);
-      if (!candidate.ok) {
-        if (parsed.action.kind === 'reset') {
-          try {
-            pi.appendEntry(THRESHOLDS_ENTRY, nextOverrides);
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            ctx.ui.notify(`self-compact: failed to reset session thresholds: ${message}`, 'error');
-            return;
-          }
-          config = candidate;
-          updateWidget(ctx);
-          ctx.ui.notify(`self-compact thresholds reset to startup flags: ${candidate.error}`, 'error');
-          return;
-        }
-        ctx.ui.notify(`${candidate.error} (existing thresholds unchanged)`, 'error');
-        return;
-      }
+      applyThresholdOverrides(ctx, nextOverrides, { allowInvalidReset: parsed.action.kind === 'reset' });
+    },
+  });
 
-      try {
-        pi.appendEntry(THRESHOLDS_ENTRY, nextOverrides);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        ctx.ui.notify(`self-compact: failed to save session thresholds: ${message}`, 'error');
-        return;
-      }
+  pi.registerCommand(THRESHOLDS_INCREASE_COMMAND, {
+    description:
+      'Increase both soft and warning compaction thresholds for this session (default +10% for % thresholds, +50k for token thresholds).',
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      handleThresholdDeltaCommand('increase', THRESHOLDS_INCREASE_COMMAND, args, ctx);
+    },
+  });
 
-      config = candidate;
-      maybeReleaseHardLock(ctx);
-      // Lowering a threshold can put usage below a previously announced level
-      // (or clear a stale notification rank); keep NOTIFY_ENTRY monotonic per
-      // cycle only for levels still at/below current level when raising.
-      const tokens = measuredTokens(ctx);
-      if (tokens !== null) {
-        const handoff = currentState(ctx);
-        const cycle = handoff?.completedCycles ?? 0;
-        const level = currentLevel(tokens);
-        const last = readNotifyState(branch(ctx));
-        if (last && last.cycle === cycle && LEVEL_RANK[level] < LEVEL_RANK[last.level]) {
-          persistNotify({ level, cycle });
-        }
-      }
-      evaluateThresholds(ctx);
-      ctx.ui.notify(formatResolvedSummary(config, nextOverrides), 'info');
+  pi.registerCommand(THRESHOLDS_DECREASE_COMMAND, {
+    description:
+      'Decrease both soft and warning compaction thresholds for this session (default -10% for % thresholds, -50k for token thresholds).',
+    handler: async (args: string, ctx: ExtensionCommandContext) => {
+      handleThresholdDeltaCommand('decrease', THRESHOLDS_DECREASE_COMMAND, args, ctx);
     },
   });
 

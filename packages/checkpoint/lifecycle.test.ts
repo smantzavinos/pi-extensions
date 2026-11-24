@@ -19,7 +19,9 @@ import extension, {
   NOW_COMMAND,
   STATE_ENTRY,
   THRESHOLDS_COMMAND,
+  THRESHOLDS_DECREASE_COMMAND,
   THRESHOLDS_ENTRY,
+  THRESHOLDS_INCREASE_COMMAND,
   TOOL_NAME,
   readHandoffState,
   readThresholdOverrides,
@@ -1137,5 +1139,82 @@ describe('/self-compact-thresholds', () => {
     });
     expect(readThresholdOverrides([custom('a', 'invalid')])).toBeUndefined();
     expect(readThresholdOverrides([custom('a', ['40%'])])).toBeUndefined();
+  });
+
+  it('supports /self-compact-thresholds-increase and -decrease with defaults, unit preservation, and buffer preservation', async () => {
+    // Small window (200k): starts on 60%/70%/10% percentage fallback -> default delta is 10%.
+    const small = makeHarness({ contextWindow: 200_000 });
+    await small.fire('session_start');
+
+    await small.runCommand(THRESHOLDS_INCREASE_COMMAND);
+    expect(small.notes().at(-1)?.type).toBe('info');
+    expect(readThresholdOverrides(small.entries)).toEqual({ softAt: '70%', at: '80%', buffer: '10%' });
+    expect(small.notes().at(-1)?.message).toContain('soft=140000 (70%)');
+    expect(small.notes().at(-1)?.message).toContain('warning=160000 (80%)');
+    expect(small.notes().at(-1)?.message).toContain('hard=180000 (90%)');
+
+    // Switch to a 1M model: preserved % overrides scale with the new window.
+    small.ctx.model = { contextWindow: 1_000_000 } as typeof small.ctx.model;
+    await small.fire('model_select');
+    await small.runCommand(THRESHOLDS_COMMAND);
+    expect(small.notes().at(-1)?.message).toContain('soft=700000 (70%)');
+    expect(small.notes().at(-1)?.message).toContain('warning=800000 (80%)');
+    expect(small.notes().at(-1)?.message).toContain('hard=900000 (90%)');
+
+    // Explicit % decrease preserves % unit and buffer.
+    await small.runCommand(THRESHOLDS_DECREASE_COMMAND, '15%');
+    expect(readThresholdOverrides(small.entries)).toEqual({ softAt: '55%', at: '65%', buffer: '10%' });
+
+    // Large window (1M): starts on 225k/250k/20k token defaults -> default delta is 50k.
+    const large = makeHarness({ contextWindow: 1_000_000 });
+    await large.fire('session_start');
+
+    await large.runCommand(THRESHOLDS_INCREASE_COMMAND);
+    expect(large.notes().at(-1)?.type).toBe('info');
+    expect(readThresholdOverrides(large.entries)).toEqual({ softAt: '275k', at: '300k' });
+    expect(large.notes().at(-1)?.message).toContain('soft=275000');
+    expect(large.notes().at(-1)?.message).toContain('warning=300000');
+    expect(large.notes().at(-1)?.message).toContain('hard=320000');
+
+    // Explicit token decrease keeps buffer untouched.
+    await large.runCommand(THRESHOLDS_DECREASE_COMMAND, '25k');
+    expect(readThresholdOverrides(large.entries)).toEqual({ softAt: '250k', at: '275k' });
+    expect(large.notes().at(-1)?.message).toContain('hard=295000');
+  });
+
+  it('rejects out-of-bounds or invalid increase/decrease without altering thresholds, and updates hard lock when valid', async () => {
+    const h = makeHarness({ initialActive: ['read', 'bash', TOOL_NAME], contextWindow: 1_000_000 });
+    await h.fire('session_start');
+    h.setUsage(280_000);
+    await h.fire('turn_end');
+    expect(h.active()).toEqual([TOOL_NAME]);
+
+    // Increase by default 50k moves hard from 270k to 320k -> lifts threshold-only hard lock.
+    await h.runCommand(THRESHOLDS_INCREASE_COMMAND);
+    expect(h.notes().at(-1)?.type).toBe('info');
+    expect(h.active()).toEqual(['read', 'bash', TOOL_NAME]);
+
+    // Decrease back by 50k moves hard back to 270k -> re-locks immediately.
+    await h.runCommand(THRESHOLDS_DECREASE_COMMAND);
+    expect(h.notes().at(-1)?.type).toBe('info');
+    expect(h.active()).toEqual([TOOL_NAME]);
+
+    // Out-of-bounds increase (exceeds 90% cap = 900k) fails cleanly, leaving overrides unchanged.
+    const beforeEntries = h.appended.length;
+    await h.runCommand(THRESHOLDS_INCREASE_COMMAND, '700k');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect(h.notes().at(-1)?.message).toContain('existing thresholds unchanged');
+    expect(h.appended.length).toBe(beforeEntries);
+
+    // Out-of-bounds decrease (soft <= 0) fails cleanly.
+    await h.runCommand(THRESHOLDS_DECREASE_COMMAND, '300k');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect(h.notes().at(-1)?.message).toContain('existing thresholds unchanged');
+    expect(h.appended.length).toBe(beforeEntries);
+
+    // Invalid argument syntax fails cleanly.
+    await h.runCommand(THRESHOLDS_INCREASE_COMMAND, '10% 20%');
+    expect(h.notes().at(-1)?.type).toBe('error');
+    expect(h.appended.length).toBe(beforeEntries);
   });
 });

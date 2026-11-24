@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
+  adjustThresholds,
   parseThreshold,
+  parseThresholdDeltaArgs,
   parseThresholdsCommandArgs,
   resolveThresholds,
   resolveThresholdsWithDefaults,
@@ -239,5 +241,95 @@ describe('parseThresholdsCommandArgs', () => {
     'soft=',
   ])('rejects invalid argument string: "%s"', (raw) => {
     expect(parseThresholdsCommandArgs(raw).ok).toBe(false);
+  });
+});
+
+describe('parseThresholdDeltaArgs', () => {
+  it('returns undefined delta when blank', () => {
+    expect(parseThresholdDeltaArgs('', 'self-compact-thresholds-increase')).toEqual({ ok: true, delta: undefined });
+    expect(parseThresholdDeltaArgs('  \t ', 'self-compact-thresholds-decrease')).toEqual({
+      ok: true,
+      delta: undefined,
+    });
+  });
+
+  it('parses a single positive percentage or token count', () => {
+    expect(parseThresholdDeltaArgs('10%', 'self-compact-thresholds-increase')).toEqual({
+      ok: true,
+      delta: { unit: 'percent', value: 10 },
+    });
+    expect(parseThresholdDeltaArgs('50k', 'self-compact-thresholds-decrease')).toEqual({
+      ok: true,
+      delta: { unit: 'tokens', value: 50_000 },
+    });
+    expect(parseThresholdDeltaArgs('0.1m', 'self-compact-thresholds-increase')).toEqual({
+      ok: true,
+      delta: { unit: 'tokens', value: 100_000 },
+    });
+  });
+
+  it.each(['0', '0%', '-10%', '10% 20%', 'soft=10%', 'abc'])('rejects invalid delta "%s"', (raw) => {
+    expect(parseThresholdDeltaArgs(raw, 'self-compact-thresholds-increase').ok).toBe(false);
+  });
+});
+
+describe('adjustThresholds', () => {
+  const none = { softAt: undefined, at: undefined, buffer: undefined };
+
+  it('defaults to 10% on percentage thresholds (small-window fallback) and preserves fallback buffer', () => {
+    const inc = adjustThresholds(none, 200_000, 'increase');
+    expect(inc).toEqual({ ok: true, softAt: '70%', at: '80%', buffer: '10%', deltaApplied: '10%' });
+
+    const dec = adjustThresholds(none, 200_000, 'decrease');
+    expect(dec).toEqual({ ok: true, softAt: '50%', at: '60%', buffer: '10%', deltaApplied: '10%' });
+  });
+
+  it('defaults to 50k on token thresholds (large-window defaults)', () => {
+    const inc = adjustThresholds(none, 1_000_000, 'increase');
+    expect(inc).toEqual({ ok: true, softAt: '275k', at: '300k', deltaApplied: '50k' });
+
+    const dec = adjustThresholds(none, 1_000_000, 'decrease');
+    expect(dec).toEqual({ ok: true, softAt: '175k', at: '200k', deltaApplied: '50k' });
+  });
+
+  it('preserves percentage units when both threshold and delta are percentages', () => {
+    const result = adjustThresholds({ softAt: '40%', at: '60%', buffer: '10%' }, 200_000, 'increase', {
+      unit: 'percent',
+      value: 5.5,
+    });
+    expect(result).toEqual({ ok: true, softAt: '45.5%', at: '65.5%', deltaApplied: '5.5%' });
+  });
+
+  it('resolves to whole tokens when mixing units (percent threshold + token delta, or token threshold + percent delta)', () => {
+    const pctPlusTok = adjustThresholds({ softAt: '40%', at: '60%', buffer: '10%' }, 200_000, 'increase', {
+      unit: 'tokens',
+      value: 20_000,
+    });
+    expect(pctPlusTok).toEqual({ ok: true, softAt: '100k', at: '140k', deltaApplied: '20k' });
+
+    const tokPlusPct = adjustThresholds({ softAt: '200k', at: '300k', buffer: '20k' }, 1_000_000, 'decrease', {
+      unit: 'percent',
+      value: 5,
+    });
+    expect(tokPlusPct).toEqual({ ok: true, softAt: '150k', at: '250k', deltaApplied: '5%' });
+  });
+
+  it('defaults to 50k when soft and at have mixed units', () => {
+    const mixed = adjustThresholds({ softAt: '20%', at: '300k', buffer: '20k' }, 1_000_000, 'increase');
+    expect(mixed).toEqual({ ok: true, softAt: '250k', at: '350k', deltaApplied: '50k' });
+  });
+
+  it('rejects shifts that would drive soft to zero or below', () => {
+    const pctZero = adjustThresholds({ softAt: '10%', at: '30%', buffer: '10%' }, 200_000, 'decrease', {
+      unit: 'percent',
+      value: 10,
+    });
+    expect(pctZero.ok).toBe(false);
+
+    const tokNeg = adjustThresholds({ softAt: '40k', at: '80k', buffer: '10k' }, 200_000, 'decrease', {
+      unit: 'tokens',
+      value: 50_000,
+    });
+    expect(tokNeg.ok).toBe(false);
   });
 });

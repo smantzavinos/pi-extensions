@@ -295,6 +295,40 @@ export interface RawFlagInputs {
 }
 
 /**
+ * Determine the effective raw threshold strings (`softAt`, `at`, `buffer`) that
+ * `resolveThresholdsWithDefaults` selects for a given window.
+ *
+ * When unsupplied flags fall back to the window-relative percentages
+ * (`60%`/`70%`/`10%`), those fallback strings are returned for the unsupplied
+ * fields; explicitly supplied values are always preserved verbatim.
+ */
+export function effectiveRawThresholds(
+  inputs: RawFlagInputs,
+  contextWindow: number,
+): { softAt: string; at: string; buffer: string; usedFallback: boolean } {
+  const fill = (soft: string, at: string, buffer: string): FlagInputs => ({
+    softAt: inputs.softAt ?? soft,
+    at: inputs.at ?? at,
+    buffer: inputs.buffer ?? buffer,
+    compactPrompt: inputs.compactPrompt,
+  });
+  const primaryInputs = fill(DEFAULT_SOFT_AT, DEFAULT_AT, DEFAULT_BUFFER);
+  const primary = resolveThresholds(primaryInputs, contextWindow);
+  if (primary.ok) {
+    return { softAt: primaryInputs.softAt, at: primaryInputs.at, buffer: primaryInputs.buffer, usedFallback: false };
+  }
+  if (inputs.softAt !== undefined && inputs.at !== undefined && inputs.buffer !== undefined) {
+    return { softAt: primaryInputs.softAt, at: primaryInputs.at, buffer: primaryInputs.buffer, usedFallback: false };
+  }
+  const fallbackInputs = fill(FALLBACK_SOFT_AT, FALLBACK_AT, FALLBACK_BUFFER);
+  const fallback = resolveThresholds(fallbackInputs, contextWindow);
+  if (fallback.ok) {
+    return { softAt: fallbackInputs.softAt, at: fallbackInputs.at, buffer: fallbackInputs.buffer, usedFallback: true };
+  }
+  return { softAt: primaryInputs.softAt, at: primaryInputs.at, buffer: primaryInputs.buffer, usedFallback: false };
+}
+
+/**
  * Resolve flags, filling unsupplied thresholds with the token defaults. If those
  * do not fit the window, retry the unsupplied thresholds with the
  * window-relative fallback so a no-flag install never fails closed. Explicitly
@@ -313,4 +347,152 @@ export function resolveThresholdsWithDefaults(inputs: RawFlagInputs, contextWind
   if (inputs.softAt !== undefined && inputs.at !== undefined && inputs.buffer !== undefined) return primary;
   const fallback = resolveThresholds(fill(FALLBACK_SOFT_AT, FALLBACK_AT, FALLBACK_BUFFER), contextWindow);
   return fallback.ok ? fallback : primary;
+}
+
+export const DEFAULT_DELTA_PERCENT = '10%';
+export const DEFAULT_DELTA_TOKENS = '50k';
+
+export type ThresholdDeltaParseResult = { ok: true; delta: ParsedThreshold | undefined } | { ok: false; error: string };
+
+/**
+ * Parse the optional single delta argument for
+ * `/self-compact-thresholds-increase` and `/self-compact-thresholds-decrease`.
+ *
+ * Accepts blank (use default) or a single positive token/percentage value
+ * (e.g. `10%`, `50k`, `50000`, `0.1m`).
+ */
+export function parseThresholdDeltaArgs(rawArgs: string, commandName: string): ThresholdDeltaParseResult {
+  const trimmed = rawArgs.trim();
+  if (trimmed.length === 0) return { ok: true, delta: undefined };
+
+  const tokens = trimmed.split(/\s+/);
+  if (tokens.length > 1) {
+    return {
+      ok: false,
+      error: `self-compact: /${commandName} takes at most one argument (e.g. /${commandName} 10% or /${commandName} 50k)`,
+    };
+  }
+  const parsed = parseThreshold(tokens[0] as string);
+  if (!parsed.ok) {
+    return {
+      ok: false,
+      error: `self-compact: /${commandName} ${parsed.error}`,
+    };
+  }
+  return { ok: true, delta: parsed.parsed };
+}
+
+function formatPercentValue(value: number): string {
+  // Trim floating-point noise (e.g. 55.1 + 10 = 65.10000000000001) while keeping
+  // exact decimal precision up to 6 places.
+  const rounded = Number(value.toFixed(6));
+  return `${rounded}%`;
+}
+
+function formatTokenValue(tokens: number): string {
+  if (tokens % 1_000_000 === 0) return `${tokens / 1_000_000}m`;
+  if (tokens % 1_000 === 0) return `${tokens / 1_000}k`;
+  return String(tokens);
+}
+
+function shiftSingleThreshold(
+  current: ParsedThreshold,
+  delta: ParsedThreshold,
+  sign: 1 | -1,
+  contextWindow: number,
+  label: string,
+): { ok: true; raw: string } | { ok: false; error: string } {
+  if (current.unit === 'percent' && delta.unit === 'percent') {
+    const next = Number((current.value + sign * delta.value).toFixed(6));
+    if (!Number.isFinite(next) || next <= 0) {
+      return {
+        ok: false,
+        error: `self-compact: ${label} would become ${next}%, which must be greater than zero`,
+      };
+    }
+    return { ok: true, raw: formatPercentValue(next) };
+  }
+
+  const currentTokens = resolveTokens(current, contextWindow);
+  if (!currentTokens.ok) return { ok: false, error: `self-compact: ${label} ${currentTokens.error}` };
+  const deltaTokens = resolveTokens(delta, contextWindow);
+  if (!deltaTokens.ok) return { ok: false, error: `self-compact: delta ${deltaTokens.error}` };
+
+  const nextTokens = currentTokens.tokens + sign * deltaTokens.tokens;
+  if (!Number.isSafeInteger(nextTokens) || nextTokens <= 0) {
+    return {
+      ok: false,
+      error: `self-compact: ${label} would become ${nextTokens} tokens, which must be greater than zero`,
+    };
+  }
+  return { ok: true, raw: formatTokenValue(nextTokens) };
+}
+
+export type AdjustThresholdsResult =
+  | { ok: true; softAt: string; at: string; buffer?: string | undefined; deltaApplied: string }
+  | { ok: false; error: string };
+
+/**
+ * Shift both `soft` and `at` by a positive delta in `direction` (`increase` or
+ * `decrease`), leaving `buffer` untouched.
+ *
+ * Default delta when `delta` is undefined:
+ *   - `10%` when both current `soft` and `at` are percentage-based
+ *   - `50k` otherwise (token-based)
+ *
+ * Unit preservation:
+ *   - If a threshold and the delta are both percentages, shifts in percentage
+ *     points so the threshold stays window-relative across model switches.
+ *   - Otherwise, resolves both to tokens for `contextWindow` and stores the
+ *     resulting whole token count.
+ */
+export function adjustThresholds(
+  inputs: RawFlagInputs,
+  contextWindow: number,
+  direction: 'increase' | 'decrease',
+  delta?: ParsedThreshold,
+): AdjustThresholdsResult {
+  if (!Number.isFinite(contextWindow) || contextWindow <= 0) {
+    return { ok: false, error: `self-compact: unknown or invalid model context window (${contextWindow})` };
+  }
+
+  const current = effectiveRawThresholds(inputs, contextWindow);
+  const softParsed = parseThreshold(current.softAt);
+  if (!softParsed.ok) {
+    return { ok: false, error: `self-compact: current soft threshold is invalid (${softParsed.error})` };
+  }
+  const atParsed = parseThreshold(current.at);
+  if (!atParsed.ok) {
+    return { ok: false, error: `self-compact: current warning threshold is invalid (${atParsed.error})` };
+  }
+
+  const bothPercent = softParsed.parsed.unit === 'percent' && atParsed.parsed.unit === 'percent';
+  const defaultRaw = bothPercent ? DEFAULT_DELTA_PERCENT : DEFAULT_DELTA_TOKENS;
+  const effectiveDelta: ParsedThreshold =
+    delta ?? (bothPercent ? { unit: 'percent', value: 10 } : { unit: 'tokens', value: 50_000 });
+  const deltaLabel =
+    delta === undefined
+      ? defaultRaw
+      : delta.unit === 'percent'
+        ? formatPercentValue(delta.value)
+        : formatTokenValue(delta.value);
+
+  const sign: 1 | -1 = direction === 'increase' ? 1 : -1;
+  const nextSoft = shiftSingleThreshold(softParsed.parsed, effectiveDelta, sign, contextWindow, 'soft');
+  if (!nextSoft.ok) return nextSoft;
+  const nextAt = shiftSingleThreshold(atParsed.parsed, effectiveDelta, sign, contextWindow, 'warning');
+  if (!nextAt.ok) return nextAt;
+
+  // If the current window was using the window-relative fallback buffer (10%)
+  // because buffer was unsupplied, preserve it so shifting soft/at does not
+  // silently flip buffer back to the 20k token default.
+  const preservedBuffer = inputs.buffer === undefined && current.usedFallback ? current.buffer : undefined;
+
+  return {
+    ok: true,
+    softAt: nextSoft.raw,
+    at: nextAt.raw,
+    ...(preservedBuffer !== undefined ? { buffer: preservedBuffer } : {}),
+    deltaApplied: deltaLabel,
+  };
 }

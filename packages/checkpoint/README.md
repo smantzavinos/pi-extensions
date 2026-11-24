@@ -37,8 +37,11 @@ pi -e /abs/path/packages/checkpoint/extensions/self-compact/self-compact.ts
   after compaction.
 - **Commands:** `/self-compact-info` (thresholds, usage, handoff state — never
   calls the model), `/self-compact-thresholds` (inspect, update, or reset
-  compaction thresholds for the active session), and `/self-compact-now` (asks
-  the agent to checkpoint now; retries a pending note verbatim).
+  compaction thresholds for the active session),
+  `/self-compact-thresholds-increase` and `/self-compact-thresholds-decrease`
+  (bump both `soft` and `at` by a percentage or token count), and
+  `/self-compact-now` (asks the agent to checkpoint now; retries a pending note
+  verbatim).
 - **Context display:** when `@nicknisi/pi-composer` (1.0+) shows a context
   meter, Checkpoint colors it and hides the separate widget. Without one, a
   20-cell context widget remains above the editor (legend below).
@@ -82,22 +85,31 @@ Thresholds are re-resolved when you switch models. Ordinary tools otherwise stay
 hard-paused until compaction, but if the new model's hard cutoff is above current
 usage, they are restored (unless a `self_compact` handoff is pending).
 
-**Runtime overrides.** Use `/self-compact-thresholds` during an active session
-without restarting Pi:
+**Runtime overrides.** Use `/self-compact-thresholds`,
+`/self-compact-thresholds-increase`, and `/self-compact-thresholds-decrease`
+during an active session without restarting Pi:
 
 ```text
 /self-compact-thresholds                               # show active thresholds
 /self-compact-thresholds soft=55% at=65% buffer=10%    # set all three
 /self-compact-thresholds at=180k                       # partial update
 /self-compact-thresholds reset                         # revert to startup flags/defaults
+/self-compact-thresholds-increase                      # +10% (if % thresholds) or +50k (if tokens)
+/self-compact-thresholds-increase 5%                   # shift soft and at up by 5%
+/self-compact-thresholds-decrease 50k                  # shift soft and at down by 50k
 ```
 
-Overrides are validated before applying (invalid input leaves existing
-thresholds unchanged), persisted in a branch-local session entry so they survive
-`/reload` and session resume without affecting other sessions, and re-evaluated
-immediately against current usage (raising the hard cutoff lifts a
-threshold-only tool pause, but never unlocks an active or failed `self_compact`
-handoff).
+`increase` and `decrease` shift both `soft` and `at` while leaving `buffer`
+unchanged. When both a threshold and the delta are percentages, percentage
+points are added/subtracted so the threshold stays window-relative on model
+switches; otherwise the shift resolves to whole tokens for the active window.
+
+Overrides are validated before applying (invalid input or out-of-bounds shifts
+leave existing thresholds unchanged), persisted in a branch-local session entry
+so they survive `/reload` and session resume without affecting other sessions,
+and re-evaluated immediately against current usage (raising the hard cutoff
+lifts a threshold-only tool pause, but never unlocks an active or failed
+`self_compact` handoff).
 
 ## Launch variants
 
